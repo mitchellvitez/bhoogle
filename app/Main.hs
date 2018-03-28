@@ -133,7 +133,6 @@ runBHoogle dbPath = do
       tz <- Tm.getCurrentTimeZone
       pure $ Tm.utcToLocalTime tz t
 
-
 -- | Main even handler for brick events
 handleEvent :: BrickState -> B.BrickEvent Name Event -> B.EventM Name (B.Next BrickState)
 handleEvent st ev =
@@ -143,8 +142,12 @@ handleEvent st ev =
     --   ms are the modifier keys
     (B.VtyEvent ve@(V.EvKey k ms)) ->
       case (k, ms) of
-        -- Escape quits the app, no matter what control has focus
-        (K.KEsc, []) -> B.halt st
+        (K.KEsc, []) ->
+          case BF.focusGetCurrent $ st ^. stFocus of
+            Just TypeSearch ->
+              B.halt st
+            _ ->
+              B.continue $ st { _stFocus = BF.focusRing [TypeSearch, TextSearch, ListResults] }
 
         _ ->
           -- How to interpret the key press depends on which control is focused
@@ -197,7 +200,7 @@ handleEvent st ev =
                 K.KChar 's' ->
                   -- Toggle the search order between ascending and descending, use asc if sort order was 'none'
                   let sortDir = if (st ^. stSortResults) == SortAsc then SortDec else SortAsc in
-                  let sorter = if sortDir == SortDec then (Lst.sortBy $ flip compareType) else (Lst.sortBy compareType) in
+                  let sorter = if sortDir == SortDec then Lst.sortBy $ flip compareType else Lst.sortBy compareType in
                   B.continue . filterResults $ st & stResults %~ sorter
                                                   & stSortResults .~ sortDir
 
@@ -247,7 +250,7 @@ filterResults st =
   let results =
         if Txt.null filterText
         then allResults
-        else filter (\t -> Txt.isInfixOf filterText . Txt.toLower $ formatResult t) allResults
+        else filter (Txt.isInfixOf filterText . Txt.toLower . formatResult) allResults
   in
   st & stResultsList .~ BL.list ListResults (Vec.fromList results) 1
   
@@ -259,43 +262,44 @@ drawUI st =
 
   where
     contentBlock =
-      (B.withBorderStyle BBS.unicode $ BB.border searchBlock)
+      B.withBorderStyle BBS.unicode (BB.border searchBlock)
       <=>
       B.padTop (B.Pad 1) resultsBlock
       
     resultsBlock =
       let total = show . length $ st ^. stResults in
       let showing = show . length $ st ^. stResultsList ^. BL.listElementsL in
-      (B.withAttr "infoTitle" $ B.txt "Results: ") <+> B.txt (showing <> "/" <> total)
+      B.withAttr "infoTitle" (B.txt "Results: ") 
+      <+> B.txt (showing <> "/" <> total)
       <=>
-      (B.padTop (B.Pad 1) $
-       resultsContent <+> resultsDetail
-      )
+      B.padTop (B.Pad 1)
+       (resultsContent <=> resultsDetail)
 
     resultsContent =
+      B.vLimit 5 $
       BL.renderList (\_ e -> B.txt $ formatResult e) False (st ^. stResultsList)
 
     resultsDetail =
       B.padLeft (B.Pad 1) $
       B.hLimit 60 $
-      vtitle "package:"
+      vtitle " "
       <=>
-      B.padLeft (B.Pad 2) (B.txt $ getSelectedDetail (\t -> maybe "" (Txt.pack . fst) (H.targetPackage t)))
+      (vtitle "package:"
+      <+>
+      B.padLeft (B.Pad 1) (B.txt $ getSelectedDetail (maybe "" (Txt.pack . fst) . H.targetPackage)))
       <=>
-      vtitle "module:"
+      (vtitle "module:"
+      <+>
+      B.padLeft (B.Pad 1) (B.txt $ getSelectedDetail (maybe "" (Txt.pack . fst) . H.targetModule)))
       <=>
-      B.padLeft (B.Pad 2) (B.txt $ getSelectedDetail (\t -> maybe "" (Txt.pack . fst) (H.targetModule t)))
+      (vtitle "docs:"
       <=>
-      vtitle "docs:"
-      <=>
-      B.padLeft (B.Pad 2) (B.txtWrap . reflow $ getSelectedDetail (Txt.pack . clean . H.targetDocs))
+      B.padLeft (B.Pad 2) (B.txtWrap . reflow $ getSelectedDetail (Txt.pack . clean . H.targetDocs)))
       <=>
       B.fill ' '
   
     searchBlock =
-      ((htitle "Type: " <+> editor TypeSearch (st ^. stEditType)) <+> time (st ^. stTime))
-      <=>
-      (htitle "Text: " <+> editor TextSearch (st ^. stEditText))
+      htitle "Type " <+> editor TypeSearch (st ^. stEditType)
 
     htitle t =
       B.hLimit 20 $
@@ -310,12 +314,6 @@ drawUI st =
       B.vLimit 1 $
       BE.renderEditor (B.txt . Txt.unlines) (BF.focusGetCurrent (st ^. stFocus) == Just n) e
 
-    time t =
-      B.padLeft (B.Pad 1) $
-      B.hLimit 20 $
-      B.withAttr "time" $
-      B.str (Tm.formatTime Tm.defaultTimeLocale "%H-%M-%S" t)
-
     getSelectedDetail fn =
       case BL.listSelectedElement $ st ^. stResultsList of
         Nothing -> ""
@@ -328,10 +326,10 @@ reflow = Txt.replace "\0" "\n\n" . Txt.replace "\n" "" . Txt.replace "\n\n" "\0"
 
 
 theMap :: BA.AttrMap
-theMap = BA.attrMap V.defAttr [ (BE.editAttr        , V.black `B.on` V.cyan)
-                              , (BE.editFocusedAttr , V.black `B.on` V.yellow)
-                              , (BL.listAttr        , V.white `B.on` V.blue)
-                              , (BL.listSelectedAttr, V.blue `B.on` V.white)
+theMap = BA.attrMap V.defAttr [ (BE.editAttr        , V.cyan `B.on` V.black)
+                              , (BE.editFocusedAttr , V.yellow `B.on` V.black)
+                              , (BL.listAttr        , V.white `B.on` V.black)
+                              , (BL.listSelectedAttr, V.yellow `B.on` V.black)
                               , ("infoTitle"        , B.fg V.cyan)
                               , ("time"             , B.fg V.yellow)
                               ]
@@ -339,7 +337,7 @@ theMap = BA.attrMap V.defAttr [ (BE.editAttr        , V.black `B.on` V.cyan)
 
 getFiles :: FilePath -> IO [FilePath]
 getFiles p = do
-  entries <- (p </>) <<$>> (Dir.listDirectory p)
+  entries <- (p </>) <<$>> Dir.listDirectory p
   filterM Dir.doesFileExist entries
 
 ----------------------------------------------------------------------------------------------
@@ -351,7 +349,7 @@ compareType a b =
   
 -- | Search hoogle using the default hoogle database
 searchHoogle :: FilePath -> Text -> IO [H.Target]
-searchHoogle path f = do
+searchHoogle path f =
   H.withDatabase path (\x -> pure $ H.searchDatabase x (Txt.unpack f))
   
 
@@ -360,7 +358,7 @@ formatResult :: H.Target -> Text
 formatResult t =
   let typ = clean $ H.targetItem t in
   let m = (clean . fst) <$> H.targetModule t in
-  Txt.pack $ fromMaybe "" m <> " :: " <> typ
+  Txt.pack $ fromMaybe "" m <> "." <> typ
   
 
 clean :: [Char] -> [Char]
